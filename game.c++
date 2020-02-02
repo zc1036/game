@@ -3,6 +3,7 @@
 #include <memory>
 #include <array>
 #include <map>
+#include <vector>
 #include <random>
 
 #include <SDL2/SDL.h>
@@ -44,6 +45,46 @@ window_ptr init() {
   return window;
 }
 
+using input_t = uint16_t;
+
+constexpr input_t bit(const int n) {
+  return (input_t)1 << n;
+}
+
+namespace input_mask {
+
+const input_t satiated = bit(0);
+
+const input_t front_fruit = bit(1);
+const input_t front_cactus = bit(2);
+const input_t left_fruit = bit(3);
+const input_t left_cactus = bit(4);
+const input_t right_fruit = bit(5);
+const input_t right_cactus = bit(6);
+
+const input_t unused1 = bit(7);
+const input_t unused2 = bit(8);
+
+const input_t stamina_low = bit(9);
+const input_t stamina_verylow = bit(10);
+
+const input_t underwater = bit(11);
+const input_t snow = bit(12);
+
+const input_t oxygen_low = bit(13);
+const input_t oxygen_verylow = bit(14);
+
+const input_t very_satiated = bit(15);
+
+const int num_active_inputs = 14; // 16 - 2 for unused1 and 2
+
+// This mask is applied after all calculations on the input, so that they always
+// get set to zero even if they're inverted or whatever. This is so that the
+// activation function sums only the bits that are useful.
+const size_t dead_inputs_mask = ~0ull ^ unused1 ^ unused2;
+
+}
+
 struct general_agent {
   enum direction {
     direction_north,
@@ -60,8 +101,6 @@ struct general_agent {
     action_moveright = 16,
   };
 };
-
-using input_t = uint16_t;
 
 template<typename Input, typename Output, int Nodes>
 struct andxor_nn_layer {
@@ -90,12 +129,23 @@ struct perceptron_agent : general_agent {
 
   direction facing = direction_north;
 
+  // this is half the width of the square of vision that the agent sits in the
+  // center of (i.e. it can see vision_distance units to the left, and to the
+  // right, and forward)
+  int vision_distance = 20;
+
   /* This agent has no hidden layers. */
 
   struct perceptron_nn {
     andxor_nn_layer<input_t, uint64_t, 5> layer1;
   } nn;
+
+  /* Statistics */
+
+  int total_fruit_eaten = 0;
 };
+
+using agent = perceptron_agent;
 
 void randomize_nn(perceptron_agent::perceptron_nn& nn) {
   std::random_device rand;
@@ -110,7 +160,7 @@ void randomize_nn(perceptron_agent::perceptron_nn& nn) {
 
   // All the thresholds are the same
   for (auto& threshold : nn.layer1.threshold) {
-    threshold = nn.layer1.layersize / 2;
+    threshold = input_mask::num_active_inputs / 2;
   }
 }
 
@@ -131,7 +181,7 @@ agent::action choose_random_action(const unsigned int bitset) {
   std::mt19937 gen(rd()); //Standard mersenne_twister_engine seeded with rd()
   std::uniform_int_distribution<> dis(0, bitcount - 1);
 
-  const int choice = dis(gen);
+  int choice = dis(gen);
   unsigned int mask = 1;
 
   while (true) {
@@ -155,7 +205,7 @@ agent::action evaluate_nn(perceptron_agent::perceptron_nn& nn,
 
   for (size_t i = 0; i < nn.layer1.layersize; ++i) {
     const auto result = (nn.layer1.and_mask[i] & input) ^ nn.layer1.xor_mask[i];
-    const auto bitcount = __builtin_popcount(result);
+    const auto bitcount = __builtin_popcount(result & input_mask::dead_inputs_mask);
 
     uint64_t active = 0;
 
@@ -171,43 +221,11 @@ agent::action evaluate_nn(perceptron_agent::perceptron_nn& nn,
   return choose_random_action(output);
 }
 
-using agent = perceptron_agent;
-
-constexpr input_t bit(const int n) {
-  return (input_t)1 << n;
-}
-
-namespace mask {
-
-const input_t satiated = bit(0);
-
-const input_t north_blue = bit(1);
-const input_t north_red = bit(2);
-const input_t west_blue = bit(3);
-const input_t west_red = bit(4);
-const input_t east_blue = bit(5);
-const input_t east_red = bit(6);
-const input_t south_blue = bit(7);
-const input_t south_red = bit(8);
-
-const input_t stamina_low = bit(9);
-const input_t stamina_verylow = bit(10);
-
-const input_t underwater = bit(11);
-const input_t snow = bit(12);
-
-const input_t oxygen_low = bit(13);
-const input_t oxygen_verylow = bit(14);
-
-const input_t very_satiated = bit(15);
-
-}
-
 enum worldent {
   world_grass = 1,
   world_water = 2,
   world_snow = 4,
-  world_food = 8,
+  world_fruit = 8,
   world_cactus = 16
 };
 
@@ -221,6 +239,7 @@ using world = std::map<std::pair<int, int>, worldent>;
 struct statistics {
   int ticks = 0;
   int longest_life = 0;
+  int most_fruit_eaten = 0;
 
   int deaths_by_cold = 0;
   int deaths_by_drowning = 0;
@@ -228,6 +247,68 @@ struct statistics {
   int deaths_by_exhaustion = 0;
   int deaths_by_gluttony = 0;
 };
+
+struct point_with_color {
+  int x, y;
+  uint32_t color;
+};
+
+input_t calculate_vision_input(const world& w, const agent& a, std::vector<point_with_color>& visible_points) {
+  const int x = 0;
+  const int y = 1;
+
+  const int north_deltas[2] = { 0, -1 };
+  const int south_deltas[2] = { 0, 1 };
+  const int east_deltas[2] = { 1, 0 };
+  const int west_deltas[2] = { -1, 0 };
+
+  const int* forward_deltas = nullptr, * left_deltas = nullptr, * right_deltas = nullptr;
+  int forward_pos[2] { }, left_pos[2] { }, right_pos[2] { };
+
+  switch (a.facing) {
+  case agent::direction_north:
+    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos - 1;
+    forward_deltas = north_deltas; right_deltas = east_deltas; left_deltas = west_deltas;
+    break;
+  case agent::direction_south:
+    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos + 1;
+    forward_deltas = south_deltas; right_deltas = west_deltas; left_deltas = east_deltas;
+    break;
+  case agent::direction_east:
+    forward_pos[x] = a.x_pos + 1; forward_pos[y] = a.y_pos;
+    forward_deltas = east_deltas; right_deltas = south_deltas; left_deltas = north_deltas;
+    break;
+  case agent::direction_west:
+    forward_pos[x] = a.x_pos - 1; forward_pos[y] = a.y_pos;
+    forward_deltas = west_deltas; right_deltas = north_deltas; left_deltas = south_deltas;
+    break;
+  }
+
+  for (int radius = 0; radius < a.vision_distance; ++radius) {
+    const int forward_vision_width = 3 + 2*radius;
+    const int left_vision_width = 1 + radius;
+    const int right_vision_width = 1 + radius;
+
+    // perform forward vision (3 + 2i tiles wide)
+    for (int tile = 0; tile < forward_vision_width; ++tile) {
+      const int tilepos[2] = {
+        // This is a way of saying "iff we moved on the y axis to advance
+        // forward vision (i.e. north or south), then we want to move on the x
+        // axis to scan tiles for vision; and vice versa.
+        forward_pos[x] + (forward_deltas[y] * forward_deltas[y]) * (-(forward_vision_width / 2) + tile),
+        forward_pos[y] + (forward_deltas[x] * forward_deltas[x]) * (-(forward_vision_width / 2) + tile),
+      };
+
+      visible_points.push_back({ .x = tilepos[x],
+                                 .y = tilepos[y],
+                                 .color = 170 - 4*radius  });
+    }
+
+    forward_pos[x] += forward_deltas[x]; forward_pos[y] += forward_deltas[y];
+    left_pos[x] += left_deltas[x]; left_pos[y] += left_deltas[y];
+    right_pos[x] += right_deltas[x]; right_pos[y] += right_deltas[y];
+  }
+}
 
 void agent_move(agent& a, int delta_ns, int delta_ew) {
   int new_ew_pos = (a.x_pos + delta_ew) % world_width;
@@ -256,7 +337,7 @@ worldent world_getent(const world& m, int x, int y) {
 }
 
 uint32_t worldent_color(const worldent we) {
-  if (world_food & we) {
+  if (world_fruit & we) {
     return 0xfcba03;
   }
 
@@ -279,7 +360,7 @@ uint32_t worldent_color(const worldent we) {
   return 0;
 }
 
-void world_draw(const agent& a, const world& m, SDL_Renderer* const renderer) {
+void world_draw(const agent& a, const world& w, SDL_Renderer* const renderer) {
   const int x_ratio = SCREEN_WIDTH / world_width;
   const int y_ratio = SCREEN_HEIGHT / world_height;
 
@@ -288,7 +369,7 @@ void world_draw(const agent& a, const world& m, SDL_Renderer* const renderer) {
 
   for (int x = 0; x < world_width; ++x) {
     for (int y = 0; y < world_height; ++y) {
-      const worldent we = world_getent(m, x, y);
+      const worldent we = world_getent(w, x, y);
 
       const uint32_t color = worldent_color(we);
 
@@ -306,6 +387,16 @@ void world_draw(const agent& a, const world& m, SDL_Renderer* const renderer) {
   const SDL_Rect outlineRect = { a.x_pos * x_ratio, a.y_pos * y_ratio, x_ratio, y_ratio };
   SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, 0xff);
   SDL_RenderFillRect(renderer, &outlineRect);
+
+  std::vector<point_with_color> visible_points;
+  calculate_vision_input(w, a, visible_points);
+
+  for (const auto point : visible_points) {
+    const SDL_Rect outlineRect = { point.x * x_ratio, point.y * y_ratio, x_ratio, y_ratio };
+    //SDL_SetRenderDrawColor(renderer, (point.color >> 16) & 0xff, (point.color >> 8) & 0xff, point.color & 0xff, 0xff);
+    SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, point.color);
+    SDL_RenderFillRect(renderer, &outlineRect);
+  }
 }
 
 agent::direction calc_new_direction(const agent::direction facing,
@@ -344,7 +435,8 @@ agent::direction calc_new_direction(const agent::direction facing,
     // rotate 90 degrees
     std::swap(vec[x], vec[y]);
     vec[x] *= -1;
-    // intentional fallthrough
+    // intentional fallthrough (turning left is like turning right and then
+    // going backwards)
       
   case agent::action_movebackward:
     vec[x] *= -1;
@@ -382,7 +474,7 @@ bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
   case agent::action_moveleft:
   case agent::action_moveright:
     a.facing = new_direction;
-    // intentional fallthrough
+    // intentional fallthrough; moving backwards doesn't change the direction he's facing
   case agent::action_movebackward:
     agent_move(a, direction_delta[new_direction][0], direction_delta[new_direction][1]);
     break;
@@ -394,16 +486,18 @@ bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
 
   a.stamina -= 1;
 
-  if (ent & world_food) {
+  if (ent & world_fruit) {
     if (ent & world_snow) {
-      // cold food is worth less
+      // cold fruit is worth less
       a.stamina += 10;
     } else if (ent & world_water) {
-      // wet food is worth more
+      // wet fruit is worth more
       a.stamina += 40;
     } else {
       a.stamina += 25;
     }
+
+    ++a.total_fruit_eaten;
   }
 
   if (ent & world_snow) {
@@ -441,7 +535,7 @@ bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
     ++s.deaths_by_cold;
   }
 
-  /* Remove food from the map */
+  /* Remove fruit from the map */
 
   if ((ent & world_terrain_mask) != ent) {
     if ((ent & world_terrain_mask) == 0 || (ent & world_terrain_mask) == world_grass) {
@@ -472,7 +566,7 @@ void randomize_world(world& w) {
   for (int n = 0; n < 240; ++n) {
     int x = dis(gen), y = dis(gen);
 
-    w[{ x, y }] = (worldent)(w[{ x, y }] | world_food);
+    w[{ x, y }] = (worldent)(w[{ x, y }] | world_fruit);
   }
 }
 
@@ -509,6 +603,8 @@ int main( int argc, char* args[] )
 
     render_ptr gRenderer { SDL_CreateRenderer( gWindow.get(), -1, SDL_RENDERER_ACCELERATED ),
                            SDL_DestroyRenderer };
+
+    SDL_SetRenderDrawBlendMode(gRenderer.get(), SDL_BLENDMODE_BLEND);
 
     //The surface contained by the window
     SDL_Surface* gScreenSurface = SDL_GetWindowSurface( gWindow.get() );
