@@ -53,12 +53,27 @@ struct general_agent {
   };
 
   enum action {
-    action_nothing,
-    action_moveforward,
-    action_movebackward,
-    action_moveleft,
-    action_moveright,
+    action_nothing = 1,
+    action_moveforward = 2,
+    action_movebackward = 4,
+    action_moveleft = 8,
+    action_moveright = 16,
   };
+};
+
+using input_t = uint16_t;
+
+template<typename Input, typename Output, int Nodes>
+struct andxor_nn_layer {
+  static const size_t layersize = Nodes;
+
+  Input and_mask[Nodes] = { };
+  Input xor_mask[Nodes] = { };
+
+  // Thresholds for each node
+  int threshold[Nodes] = { };
+  
+  Output output;
 };
 
 struct perceptron_agent : general_agent {
@@ -74,11 +89,89 @@ struct perceptron_agent : general_agent {
   int heat = 100;
 
   direction facing = direction_north;
+
+  /* This agent has no hidden layers. */
+
+  struct perceptron_nn {
+    andxor_nn_layer<input_t, uint64_t, 5> layer1;
+  } nn;
 };
 
-using agent = perceptron_agent;
+void randomize_nn(perceptron_agent::perceptron_nn& nn) {
+  std::random_device rand;
 
-using input_t = uint16_t;
+  char rndmem[sizeof(nn.layer1)] = { };
+
+  for (char& c : rndmem) {
+    c = rand() & 0xff;
+  }
+
+  memcpy(&nn.layer1, rndmem, sizeof(rndmem));
+
+  // All the thresholds are the same
+  for (auto& threshold : nn.layer1.threshold) {
+    threshold = nn.layer1.layersize / 2;
+  }
+}
+
+// Choose a random bit in a mask
+agent::action choose_random_action(const unsigned int bitset) {
+  if (!bitset) {
+    std::cout << "bitset empty, this is a bug\n";
+    return agent::action_nothing;
+  }
+
+  const int bitcount = __builtin_popcount(bitset);
+
+  if (bitcount == 1) {
+    return (agent::action)bitset;
+  }
+
+  std::random_device rd;  //Will be used to obtain a seed for the random number engine
+  std::mt19937 gen(rd()); //Standard mersenne_twister_engine seeded with rd()
+  std::uniform_int_distribution<> dis(0, bitcount - 1);
+
+  const int choice = dis(gen);
+  unsigned int mask = 1;
+
+  while (true) {
+    if (bitset & mask) {
+      if (choice == 0) {
+        break;
+      }
+
+      --choice;
+    }
+
+    mask <<= 1;
+  }
+
+  return (agent::action)mask;
+}
+
+agent::action evaluate_nn(perceptron_agent::perceptron_nn& nn,
+                          const input_t input) {
+  uint64_t output = 0;
+
+  for (size_t i = 0; i < nn.layer1.layersize; ++i) {
+    const auto result = (nn.layer1.and_mask[i] & input) ^ nn.layer1.xor_mask[i];
+    const auto bitcount = __builtin_popcount(result);
+
+    uint64_t active = 0;
+
+    if (bitcount >= nn.layer1.threshold[i]) {
+      active = 1;
+    }
+
+    output |= active << i;
+  }
+
+  nn.layer1.output = output;
+
+  return choose_random_action(output);
+}
+
+using agent = perceptron_agent;
 
 constexpr input_t bit(const int n) {
   return (input_t)1 << n;
@@ -269,6 +362,8 @@ agent::direction calc_new_direction(const agent::direction facing,
 }
 
 bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
+  ++s.ticks;
+
   /* Calculate the agent's new position and move it there */
 
   const agent::direction new_direction = calc_new_direction(a.facing, act);
@@ -428,7 +523,11 @@ int main( int argc, char* args[] )
     //Main loop flag
     bool quit = false;
 
-    agent a;
+    std::unique_ptr<agent> a_ptr(new agent);
+    agent& a = *a_ptr;
+
+    randomize_nn(a.nn);
+
     a.x_pos = world_width / 2;
     a.y_pos = world_height / 2;
 
