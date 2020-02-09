@@ -62,8 +62,8 @@ const input_t left_cactus = bit(4);
 const input_t right_fruit = bit(5);
 const input_t right_cactus = bit(6);
 
-const input_t unused1 = bit(7);
-const input_t unused2 = bit(8);
+const input_t heat_low = bit(7);
+const input_t heat_verylow = bit(8);
 
 const input_t stamina_low = bit(9);
 const input_t stamina_verylow = bit(10);
@@ -76,12 +76,12 @@ const input_t oxygen_verylow = bit(14);
 
 const input_t very_satiated = bit(15);
 
-const int num_active_inputs = 14; // 16 - 2 for unused1 and 2
+const int num_active_inputs = 16; // all 16 bits used
 
 // This mask is applied after all calculations on the input, so that they always
 // get set to zero even if they're inverted or whatever. This is so that the
 // activation function sums only the bits that are useful.
-const size_t dead_inputs_mask = ~0ull ^ unused1 ^ unused2;
+const size_t dead_inputs_mask = ~0ull;
 
 }
 
@@ -218,7 +218,11 @@ agent::action evaluate_nn(perceptron_agent::perceptron_nn& nn,
 
   nn.layer1.output = output;
 
-  return choose_random_action(output);
+  if (output) {
+    return choose_random_action(output);
+  } else {
+    return agent::action_nothing;
+  }
 }
 
 enum worldent {
@@ -253,63 +257,6 @@ struct point_with_color {
   uint32_t color;
 };
 
-input_t calculate_vision_input(const world& w, const agent& a, std::vector<point_with_color>& visible_points) {
-  const int x = 0;
-  const int y = 1;
-
-  const int north_deltas[2] = { 0, -1 };
-  const int south_deltas[2] = { 0, 1 };
-  const int east_deltas[2] = { 1, 0 };
-  const int west_deltas[2] = { -1, 0 };
-
-  const int* forward_deltas = nullptr, * left_deltas = nullptr, * right_deltas = nullptr;
-  int forward_pos[2] { }, left_pos[2] { }, right_pos[2] { };
-
-  switch (a.facing) {
-  case agent::direction_north:
-    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos - 1;
-    forward_deltas = north_deltas; right_deltas = east_deltas; left_deltas = west_deltas;
-    break;
-  case agent::direction_south:
-    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos + 1;
-    forward_deltas = south_deltas; right_deltas = west_deltas; left_deltas = east_deltas;
-    break;
-  case agent::direction_east:
-    forward_pos[x] = a.x_pos + 1; forward_pos[y] = a.y_pos;
-    forward_deltas = east_deltas; right_deltas = south_deltas; left_deltas = north_deltas;
-    break;
-  case agent::direction_west:
-    forward_pos[x] = a.x_pos - 1; forward_pos[y] = a.y_pos;
-    forward_deltas = west_deltas; right_deltas = north_deltas; left_deltas = south_deltas;
-    break;
-  }
-
-  for (int radius = 0; radius < a.vision_distance; ++radius) {
-    const int forward_vision_width = 3 + 2*radius;
-    const int left_vision_width = 1 + radius;
-    const int right_vision_width = 1 + radius;
-
-    // perform forward vision (3 + 2i tiles wide)
-    for (int tile = 0; tile < forward_vision_width; ++tile) {
-      const int tilepos[2] = {
-        // This is a way of saying "iff we moved on the y axis to advance
-        // forward vision (i.e. north or south), then we want to move on the x
-        // axis to scan tiles for vision; and vice versa.
-        forward_pos[x] + (forward_deltas[y] * forward_deltas[y]) * (-(forward_vision_width / 2) + tile),
-        forward_pos[y] + (forward_deltas[x] * forward_deltas[x]) * (-(forward_vision_width / 2) + tile),
-      };
-
-      visible_points.push_back({ .x = tilepos[x],
-                                 .y = tilepos[y],
-                                 .color = 170 - 4*radius  });
-    }
-
-    forward_pos[x] += forward_deltas[x]; forward_pos[y] += forward_deltas[y];
-    left_pos[x] += left_deltas[x]; left_pos[y] += left_deltas[y];
-    right_pos[x] += right_deltas[x]; right_pos[y] += right_deltas[y];
-  }
-}
-
 void agent_move(agent& a, int delta_ns, int delta_ew) {
   int new_ew_pos = (a.x_pos + delta_ew) % world_width;
   int new_ns_pos = (a.y_pos + delta_ns) % world_height;
@@ -326,7 +273,31 @@ void agent_move(agent& a, int delta_ns, int delta_ew) {
   a.y_pos = new_ns_pos;
 }
 
+void world_putent(world& w, int x, int y, const worldent ent) {
+  x %= world_width;
+  y %= world_height;
+
+  if (x < 0) {
+    x = world_width + x;
+  }
+  if (y < 0) {
+    y = world_height + y;
+  }
+
+  w[{ x, y }] = ent;
+}
+
 worldent world_getent(const world& m, int x, int y) {
+  x %= world_width;
+  y %= world_height;
+
+  if (x < 0) {
+    x = world_width + x;
+  }
+  if (y < 0) {
+    y = world_height + y;
+  }
+
   const auto it = m.find(std::make_pair(x, y));
 
   if (it == std::end(m)) {
@@ -360,7 +331,147 @@ uint32_t worldent_color(const worldent we) {
   return 0;
 }
 
-void world_draw(const agent& a, const world& w, SDL_Renderer* const renderer) {
+input_t calculate_vision_input(const world& w, const agent& a
+#ifdef DRAW_VISION
+                               , std::vector<point_with_color>& visible_points
+#endif
+                               ) {
+  const int x = 0;
+  const int y = 1;
+
+  const int north_deltas[2] = { 0, -1 };
+  const int south_deltas[2] = { 0, 1 };
+  const int east_deltas[2] = { 1, 0 };
+  const int west_deltas[2] = { -1, 0 };
+
+  const int* forward_deltas = nullptr, * left_deltas = nullptr, * right_deltas = nullptr;
+  int forward_pos[2] { }, left_pos[2] { }, right_pos[2] { };
+
+  switch (a.facing) {
+  case agent::direction_north:
+    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos - 1;
+    left_pos[x] = a.x_pos - 1; left_pos[y] = a.y_pos;
+    right_pos[x] = a.x_pos + 1; right_pos[y] = a.y_pos;
+    forward_deltas = north_deltas; right_deltas = east_deltas; left_deltas = west_deltas;
+    break;
+  case agent::direction_south:
+    forward_pos[x] = a.x_pos; forward_pos[y] = a.y_pos + 1;
+    left_pos[x] = a.x_pos + 1; left_pos[y] = a.y_pos;
+    right_pos[x] = a.x_pos - 1; right_pos[y] = a.y_pos;
+    forward_deltas = south_deltas; right_deltas = west_deltas; left_deltas = east_deltas;
+    break;
+  case agent::direction_east:
+    forward_pos[x] = a.x_pos + 1; forward_pos[y] = a.y_pos;
+    left_pos[x] = a.x_pos; left_pos[y] = a.y_pos - 1;
+    right_pos[x] = a.x_pos; right_pos[y] = a.y_pos + 1;
+    forward_deltas = east_deltas; right_deltas = south_deltas; left_deltas = north_deltas;
+    break;
+  case agent::direction_west:
+    forward_pos[x] = a.x_pos - 1; forward_pos[y] = a.y_pos;
+    left_pos[x] = a.x_pos; left_pos[y] = a.y_pos + 1;
+    right_pos[x] = a.x_pos; right_pos[y] = a.y_pos - 1;
+    forward_deltas = west_deltas; right_deltas = north_deltas; left_deltas = south_deltas;
+    break;
+  }
+
+  input_t vision_input = 0;
+
+  bool found_front = false,
+       found_left = false,
+       found_right = false;
+
+  for (int radius = 0; radius < a.vision_distance; ++radius) {
+    const int forward_vision_width = 3 + 2*radius;
+    const int side_vision_width = 3 + 2*radius;
+
+    // perform forward vision (3+2i tiles wide)
+    for (int tile = 0; !found_front && tile < forward_vision_width; ++tile) {
+      const int tilepos[2] = {
+        // This is a way of saying "iff we moved on the y axis to advance
+        // forward vision (i.e. north or south), then we want to move on the x
+        // axis to scan tiles for vision"; and vice versa.
+        forward_pos[x] + (forward_deltas[y] * forward_deltas[y]) * (-(forward_vision_width / 2) + tile),
+        forward_pos[y] + (forward_deltas[x] * forward_deltas[x]) * (-(forward_vision_width / 2) + tile),
+      };
+
+      const worldent tileent = world_getent(w, tilepos[x], tilepos[y]);
+
+      if (tileent & world_cactus) {
+        found_front = true;
+        vision_input |= input_mask::front_cactus;
+      } else if (tileent & world_fruit) {
+        found_front = true;
+        vision_input |= input_mask::front_fruit;
+      }
+
+#ifdef DRAW_VISION
+      visible_points.push_back({ .x = tilepos[x],
+                                 .y = tilepos[y],
+                                 .color = 170 - 4*radius  });
+#endif
+    }
+
+    // perform left vision (3+2i tiles wide)
+    for (int tile = 0; tile < side_vision_width; ++tile) {
+      const int left_tilepos[2] = {
+        left_pos[x] + (left_deltas[y] * left_deltas[y]) * (-(forward_vision_width / 2) + tile),
+        left_pos[y] + (left_deltas[x] * left_deltas[x]) * (-(forward_vision_width / 2) + tile),
+      };
+
+      const worldent tileent = world_getent(w, left_tilepos[x], left_tilepos[y]);
+
+      if (tileent & world_cactus) {
+        found_left = true;
+        vision_input |= input_mask::left_cactus;
+      } else if (tileent & world_fruit) {
+        found_left = true;
+        vision_input |= input_mask::left_fruit;
+      }
+
+#ifdef DRAW_VISION
+      visible_points.push_back({ .x = left_tilepos[x],
+                                 .y = left_tilepos[y],
+                                 .color = 170 - 4*radius  });
+#endif
+    }
+
+    // perform right vision (3+2i tiles wide)
+    for (int tile = 0; tile < side_vision_width; ++tile) {
+      const int right_tilepos[2] = {
+        right_pos[x] + (right_deltas[y] * right_deltas[y]) * (-(forward_vision_width / 2) + tile),
+        right_pos[y] + (right_deltas[x] * right_deltas[x]) * (-(forward_vision_width / 2) + tile),
+      };
+
+      const worldent tileent = world_getent(w, right_tilepos[x], right_tilepos[y]);
+
+      if (tileent & world_cactus) {
+        found_right = true;
+        vision_input |= input_mask::right_cactus;
+      } else if (tileent & world_fruit) {
+        found_right = true;
+        vision_input |= input_mask::right_fruit;
+      }
+
+#ifdef DRAW_VISION
+      visible_points.push_back({ .x = right_tilepos[x],
+                                 .y = right_tilepos[y],
+                                 .color = 170 - 4*radius  });
+#endif
+    }
+
+    forward_pos[x] += forward_deltas[x]; forward_pos[y] += forward_deltas[y];
+    left_pos[x] += left_deltas[x]; left_pos[y] += left_deltas[y];
+    right_pos[x] += right_deltas[x]; right_pos[y] += right_deltas[y];
+  }
+
+  return vision_input;
+}
+
+void world_draw(const agent& a, const world& w, SDL_Renderer* const renderer
+#ifdef DRAW_VISION
+                , const std::vector<point_with_color>& visible_points
+#endif
+) {
   const int x_ratio = SCREEN_WIDTH / world_width;
   const int y_ratio = SCREEN_HEIGHT / world_height;
 
@@ -388,15 +499,14 @@ void world_draw(const agent& a, const world& w, SDL_Renderer* const renderer) {
   SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, 0xff);
   SDL_RenderFillRect(renderer, &outlineRect);
 
-  std::vector<point_with_color> visible_points;
-  calculate_vision_input(w, a, visible_points);
-
+#ifdef DRAW_VISION
   for (const auto point : visible_points) {
     const SDL_Rect outlineRect = { point.x * x_ratio, point.y * y_ratio, x_ratio, y_ratio };
     //SDL_SetRenderDrawColor(renderer, (point.color >> 16) & 0xff, (point.color >> 8) & 0xff, point.color & 0xff, 0xff);
     SDL_SetRenderDrawColor(renderer, 0xff, 0xff, 0xff, point.color);
     SDL_RenderFillRect(renderer, &outlineRect);
   }
+#endif
 }
 
 agent::direction calc_new_direction(const agent::direction facing,
@@ -451,6 +561,59 @@ agent::direction calc_new_direction(const agent::direction facing,
   }
 
   return vector_to_direction[1 + vec[y]][1 + vec[x]];
+}
+
+input_t calculate_senses(const world& w, const agent& a) {
+  input_t in = 0;
+
+  using namespace input_mask;
+
+  const worldent current_tile = world_getent(w, a.x_pos, a.y_pos);
+
+  // Attributes
+
+  if (a.stamina + a.max_stamina / 4 > a.max_stamina) {
+    in |= satiated;
+  }
+
+  if (a.stamina + a.max_stamina / 6 > a.max_stamina) {
+    in |= very_satiated;
+  }
+
+  if (a.stamina < a.max_stamina / 8) {
+    in |= stamina_low;
+  }
+
+  if (a.stamina < a.max_stamina / 16) {
+    in |= stamina_verylow;
+  }
+
+  if (a.oxygen < a.max_oxygen / 8) {
+    in |= oxygen_low;
+  }
+
+  if (a.oxygen < a.max_oxygen / 16) {
+    in |= oxygen_verylow;
+  }
+
+  if (a.heat < a.max_heat / 8) {
+    in |= heat_low;
+  }
+
+  if (a.heat < a.max_heat / 16) {
+    in |= heat_verylow;
+  }
+
+  // Environment
+
+  if (world_water & current_tile) {
+    in |= underwater;
+  }
+  if (world_snow & current_tile) {
+    in |= snow;
+  }
+
+  return in;
 }
 
 bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
@@ -541,7 +704,7 @@ bool runtick(statistics& s, world& w, agent& a, const agent::action act) {
     if ((ent & world_terrain_mask) == 0 || (ent & world_terrain_mask) == world_grass) {
       w.erase({ a.x_pos, a.y_pos });
     } else {
-      w[{ a.x_pos, a.y_pos }] = (worldent)(ent & world_terrain_mask);
+      world_putent(w, a.x_pos, a.y_pos, (worldent)(ent & world_terrain_mask));
     }
   }
 
@@ -621,17 +784,21 @@ int main( int argc, char* args[] )
 
     std::unique_ptr<agent> a_ptr(new agent);
     agent& a = *a_ptr;
+    world w;
 
-    randomize_nn(a.nn);
+    auto reset = [&w, &a]() {
+      w = world();
+      randomize_world(w);
 
-    a.x_pos = world_width / 2;
-    a.y_pos = world_height / 2;
+      a = agent();
+      randomize_nn(a.nn);
+      a.x_pos = world_width / 2;
+      a.y_pos = world_height / 2;
+    };
 
     statistics stats;
 
-    world w;
-
-    randomize_world(w);
+    reset();
 
     //While application is running
     while( !quit ) {
@@ -654,29 +821,45 @@ int main( int argc, char* args[] )
 
       SDL_Event e { };
 
+      agent::action act = agent::action_nothing;
+
       //Handle events on queue
       while( SDL_PollEvent( &e ) != 0 ) {
         //User requests quit
         if( e.type == SDL_QUIT ) {
           quit = true;
         }
+#ifdef ACTION_KEYBOARD
         //User presses a key
         else if( e.type == SDL_KEYDOWN ) {
           switch (e.key.keysym.sym) {
           case SDLK_f:
-            runtick(stats, w, a, agent::action_moveforward);
+            act = agent::action_moveforward;
             break;
           case SDLK_r:
-            runtick(stats, w, a, agent::action_moveright);
+            act = agent::action_moveright;
             break;
           case SDLK_l:
-            runtick(stats, w, a, agent::action_moveleft);
+            act = agent::action_moveleft;
             break;
           case SDLK_b:
-            runtick(stats, w, a, agent::action_movebackward);
+            act = agent::action_movebackward;
             break;
           }
         }
+#endif
+      }
+
+#ifndef ACTION_KEYBOARD
+      input_t input = calculate_senses(w, a);
+      input |= calculate_vision_input(w, a);
+      act = evaluate_nn(a.nn, input);
+#endif
+
+      const bool alive = runtick(stats, w, a, act);
+
+      if (!alive) {
+        reset();
       }
     }
   }
